@@ -6,9 +6,13 @@ All Rights Reserved
 
 '''
 
+#
+# To disable SSL cert verification for connecting to splunk API:
+# export PYTHONHTTPSVERIFY=0
+#
 import sys,logging,os,time,re,threading
 import xml.dom.minidom
-from datetime import datetime
+from datetime import datetime, timedelta
 
 SPLUNK_HOME = os.environ.get("SPLUNK_HOME")
 
@@ -21,12 +25,12 @@ EGG_DIR = SPLUNK_HOME + "/etc/apps/cloudflare/bin/"
 
 for filename in os.listdir(EGG_DIR):
     if filename.endswith(".egg"):
-        sys.path.append(EGG_DIR + filename) 
-       
+        sys.path.append(EGG_DIR + filename)
+
 import requests, json
 from splunklib.client import connect
 from splunklib.client import Service
-           
+
 #set up logging
 logging.root
 logging.root.setLevel(logging.ERROR)
@@ -36,6 +40,20 @@ handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 logging.root.addHandler(handler)
 
+# These two lines enable debugging at httplib level (requests->urllib3->http.client)
+# You will see the REQUEST, including HEADERS and DATA, and RESPONSE with HEADERS but without DATA.
+# The only thing missing will be the response.body which is not logged.
+# try:
+#     import http.client as http_client
+# except ImportError:
+#     # Python 2
+#     import httplib as http_client
+# http_client.HTTPConnection.debuglevel = 1
+#
+# requests_log = logging.getLogger("requests.packages.urllib3")
+# requests_log.setLevel(logging.DEBUG)
+# requests_log.propagate = True
+
 SCHEME = """<scheme>
     <title>CloudFlare Log Share</title>
     <description>CloudFlare Log Share input</description>
@@ -44,7 +62,7 @@ SCHEME = """<scheme>
     <use_single_instance>false</use_single_instance>
 
     <endpoint>
-        <args>    
+        <args>
             <arg name="name">
                 <title>Name</title>
                 <description>Name of this CloudFlare input</description>
@@ -102,21 +120,23 @@ class CloudFlareEventHandler:
         pass
 
     def __call__(self, response_object, raw_response_output, req_args, last_ray_id):
+        #logging.debug("Processing response: %s" % raw_response_output)
         req = json.loads(raw_response_output)
         last_rayid = 0
 
-        if "rayId" not in req:
+        if "RayID" not in req:
+            logging.info("No ray ID in response, skipping")
             return
 
 
-        rayid = req['rayId']
+        rayid = req['RayID']
         if rayid == last_ray_id:
             return
 
         print json.dumps(req)
 
         if not "params" in req_args:
-	    req_args["params"] = {}
+            req_args["params"] = {}
 
         req_args["params"]["start_id"] = rayid
 
@@ -125,31 +145,31 @@ def get_current_datetime_for_cron():
     #dont need seconds/micros for cron
     current_dt = current_dt.replace(second=0, microsecond=0)
     return current_dt
-            
+
 def do_validate():
-    config = get_validation_config() 
-    
+    config = get_validation_config()
+
 def do_run(config):
     server_uri = config.get("server_uri")
     global SPLUNK_PORT
     global STANZA
-    global SESSION_TOKEN 
+    global SESSION_TOKEN
     global delimiter
     SPLUNK_PORT = server_uri[18:]
     STANZA = config.get("name")
     SESSION_TOKEN = config.get("session_key")
-   
+
     zone_name = config.get("zone_name")
     auth_email = config.get("auth_email")
     auth_key = config.get("auth_key")
     last_ray_id = config.get("last_ray_id", 0)
- 
+
     request_timeout = int(config.get("request_timeout", 30))
-    
+
     backoff_time = int(config.get("backoff_time", 10))
-    
+
     polling_interval = int(config.get("polling_interval", 60))
-    
+
     cloudflare_handler = CloudFlareEventHandler()
 
     headers = {
@@ -158,17 +178,17 @@ def do_run(config):
     }
 
     zone_tag = None
-    r = requests.get("https://api.cloudflare.com/client/v4/zones", params={'name': zone_name}, headers=headers).json()
+    r = requests.get("https://api.cloudflare.com/client/v4/zones", params={'name': zone_name}, headers=headers, verify=False).json()
     for result in r['result']:
         zone_tag = result['id']
-
+        logging.debug("found zone_tag %s" % zone_tag)
     if not zone_tag:
         logging.error("Zone not found: %s." % zone_name)
         sys.exit(2)
 
-    try: 
+    try:
         req_args = {
-            "verify": True,
+            "verify": False,
             "stream": True,
             "timeout": float(request_timeout),
             "headers": headers
@@ -178,10 +198,13 @@ def do_run(config):
             if last_ray_id:
                 req_args['params'] = { 'start_id': last_ray_id }
             else:
-                req_args['params'] = { 'start': 0 }
+                starttime = (datetime.utcnow() + timedelta(minutes=-10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                endtime = (datetime.utcnow() + timedelta(minutes=-5)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                req_args['params'] = {'start': starttime, 'end': endtime}
 
             try:
-                r = requests.get("https://api.cloudflare.com/client/v4/zones/%s/logs/requests" % zone_tag, **req_args)
+                logging.debug("Retrieving logs with args %s " % str(req_args))
+                r = requests.get("https://api.cloudflare.com/client/v4/zones/%s/logs/received" % zone_tag, **req_args)
             except requests.exceptions.Timeout,e:
                 logging.error("HTTP Request Timeout error: %s" % str(e))
                 time.sleep(float(backoff_time))
@@ -193,6 +216,7 @@ def do_run(config):
 
             try:
                 r.raise_for_status()
+                logging.debug("Processing HTTP response lines")
                 for line in r.iter_lines():
                     if not line:
                         continue
@@ -209,12 +233,12 @@ def do_run(config):
                 logging.error("HTTP Request error: %s" % str(e))
                 time.sleep(float(backoff_time))
                 continue
-              
+
             time.sleep(float(polling_interval))
     except RuntimeError,e:
         logging.error("Looks like an error: %s" % str(e))
-        sys.exit(2) 
-         
+        sys.exit(2)
+
 def update_rayid(req_args, ray_id):
     if 'start_id' not in req_args['params'] or req_args['params']['start_id'] == ray_id:
         return
@@ -224,8 +248,8 @@ def update_rayid(req_args, ray_id):
         item = service.inputs.__getitem__(STANZA[13:])
         item.update(last_ray_id=req_args['params']['start_id'])
     except RuntimeError,e:
-        logging.error("Looks like an error updating the modular input parameter last_ray_id: %s" % (rest_name,str(e),))   
-        
+        logging.error("Looks like an error updating the modular input parameter last_ray_id: %s" % (rest_name,str(e),))
+
 def usage():
     print "usage: %s [--scheme|--validate-arguments]"
     logging.error("Incorrect Program Usage")
@@ -241,21 +265,22 @@ def get_input_config():
     try:
         # read everything from stdin
         config_str = sys.stdin.read()
+        # logging.debug("Config XML: %s" % config_str)
 
         # parse the config XML
         doc = xml.dom.minidom.parseString(config_str)
         root = doc.documentElement
-        
+
         session_key_node = root.getElementsByTagName("session_key")[0]
         if session_key_node and session_key_node.firstChild and session_key_node.firstChild.nodeType == session_key_node.firstChild.TEXT_NODE:
             data = session_key_node.firstChild.data
-            config["session_key"] = data 
-            
+            config["session_key"] = data
+
         server_uri_node = root.getElementsByTagName("server_uri")[0]
         if server_uri_node and server_uri_node.firstChild and server_uri_node.firstChild.nodeType == server_uri_node.firstChild.TEXT_NODE:
             data = server_uri_node.firstChild.data
-            config["server_uri"] = data   
-            
+            config["server_uri"] = data
+
         conf_node = root.getElementsByTagName("configuration")[0]
         if conf_node:
             logging.debug("XML: found configuration")
@@ -271,20 +296,20 @@ def get_input_config():
                         param_name = param.getAttribute("name")
                         logging.debug("XML: found param '%s'" % param_name)
                         if param_name and param.firstChild and \
-                           param.firstChild.nodeType == param.firstChild.TEXT_NODE:
+                                param.firstChild.nodeType == param.firstChild.TEXT_NODE:
                             data = param.firstChild.data
                             config[param_name] = data
                             logging.debug("XML: '%s' -> '%s'" % (param_name, data))
 
         checkpnt_node = root.getElementsByTagName("checkpoint_dir")[0]
         if checkpnt_node and checkpnt_node.firstChild and \
-           checkpnt_node.firstChild.nodeType == checkpnt_node.firstChild.TEXT_NODE:
+                checkpnt_node.firstChild.nodeType == checkpnt_node.firstChild.TEXT_NODE:
             config["checkpoint_dir"] = checkpnt_node.firstChild.data
 
         if not config:
             raise Exception, "Invalid configuration received from Splunk."
 
-        
+
     except Exception, e:
         raise Exception, "Error getting Splunk configuration via STDIN: %s" % str(e)
 
@@ -314,14 +339,14 @@ def get_validation_config():
             name = param.getAttribute("name")
             logging.debug("Found param %s" % name)
             if name and param.firstChild and \
-               param.firstChild.nodeType == param.firstChild.TEXT_NODE:
+                    param.firstChild.nodeType == param.firstChild.TEXT_NODE:
                 val_data[name] = param.firstChild.data
 
     return val_data
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
-        if sys.argv[1] == "--scheme":           
+        if sys.argv[1] == "--scheme":
             do_scheme()
         elif sys.argv[1] == "--validate-arguments":
             do_validate()
@@ -330,5 +355,5 @@ if __name__ == '__main__':
     else:
         config = get_input_config()
         do_run(config)
-        
+
     sys.exit(0)
